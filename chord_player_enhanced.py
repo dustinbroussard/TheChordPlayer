@@ -366,31 +366,36 @@ def detect_chords_enhanced(path, progress_callback=None, status_callback=None, *
     if status_callback:
         status_callback("Matching chords...")
     
+    # Add periodic progress updates
+    frame_count = chroma_norm.shape[1]
+    update_interval = max(10, frame_count // 100)  # Update at least every 1%
+    
     # Enhanced chord detection
     chords = []
     times = librosa.frames_to_time(np.arange(chroma_norm.shape[1]), sr=sr, hop_length=HOP_LENGTH)
     
-    for t, chroma_frame in zip(times, chroma_norm.T):
+    for frame_idx, (t, chroma_frame) in enumerate(zip(times, chroma_norm.T)):
+        if frame_idx % update_interval == 0 and progress_callback:
+            new_progress = min(99, 75 + int(20 * (frame_idx / frame_count)))
+            progress_callback(new_progress)
+        # Simplified and optimized similarity calculation
         similarities = {}
-        
-        for chord_name, template in templates.items():
-            # Multiple similarity metrics
+        templates_filtered = {
+            k: v for k, v in templates.items() 
+            if not k.startswith(('dim', 'aug', 'sus')) and 'b' not in k and '#' not in k
+        }  # Start with simpler chords
+            
+        # First pass with simpler chords only
+        for chord_name, template in templates_filtered.items():
             cos_sim = np.dot(template, chroma_frame) / (np.linalg.norm(template) * np.linalg.norm(chroma_frame) + 1e-8)
+            similarities[chord_name] = cos_sim  # Just use cosine similarity for speed
             
-            # Euclidean distance (inverted and normalized)
-            euc_dist = 1.0 / (1.0 + np.linalg.norm(template - chroma_frame))
-            
-            # Correlation coefficient
-            corr_coef = np.corrcoef(template, chroma_frame)[0, 1]
-            if np.isnan(corr_coef):
-                corr_coef = 0
-            
-            # Chi-squared distance (inverted)
-            chi2_dist = 1.0 / (1.0 + np.sum((template - chroma_frame) ** 2 / (template + chroma_frame + 1e-8)))
-            
-            # Weighted combination
-            combined_sim = 0.4 * cos_sim + 0.25 * euc_dist + 0.25 * corr_coef + 0.1 * chi2_dist
-            similarities[chord_name] = combined_sim
+        # Only compute complex chords if no strong match found
+        if not similarities or max(similarities.values()) < 0.7:
+            for chord_name, template in templates.items():
+                if chord_name not in templates_filtered:
+                    cos_sim = np.dot(template, chroma_frame) / (np.linalg.norm(template) * np.linalg.norm(chroma_frame) + 1e-8)
+                    similarities[chord_name] = cos_sim
         
         # Find best match
         best_match = max(similarities.items(), key=lambda x: x[1])
