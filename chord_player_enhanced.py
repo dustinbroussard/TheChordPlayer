@@ -378,24 +378,35 @@ def detect_chords_enhanced(path, progress_callback=None, status_callback=None, *
         if frame_idx % update_interval == 0 and progress_callback:
             new_progress = min(99, 75 + int(20 * (frame_idx / frame_count)))
             progress_callback(new_progress)
-        # Simplified and optimized similarity calculation
+            
+        # First check for simple triads (major, minor)
         similarities = {}
-        templates_filtered = {
+        simple_templates = {
             k: v for k, v in templates.items() 
-            if not k.startswith(('dim', 'aug', 'sus')) and 'b' not in k and '#' not in k
-        }  # Start with simpler chords
-            
-        # First pass with simpler chords only
-        for chord_name, template in templates_filtered.items():
+            if k in ['', 'm']  # Only major and minor triads first
+        }
+        
+        # First pass with just major/minor chords
+        for chord_name, template in simple_templates.items():
             cos_sim = np.dot(template, chroma_frame) / (np.linalg.norm(template) * np.linalg.norm(chroma_frame) + 1e-8)
-            similarities[chord_name] = cos_sim  # Just use cosine similarity for speed
+            similarities[note + chord_name] = cos_sim  # Add root note
             
-        # Only compute complex chords if no strong match found
-        if not similarities or max(similarities.values()) < 0.7:
-            for chord_name, template in templates.items():
-                if chord_name not in templates_filtered:
-                    cos_sim = np.dot(template, chroma_frame) / (np.linalg.norm(template) * np.linalg.norm(chroma_frame) + 1e-8)
-                    similarities[chord_name] = cos_sim
+        # If no clear match (cosine similarity < 0.8), check dominant 7ths
+        if not similarities or max(similarities.values()) < 0.8:
+            dominant_templates = {k: v for k, v in templates.items() if k in ['7', 'm7']}
+            for chord_name, template in dominant_templates.items():
+                cos_sim = np.dot(template, chroma_frame) / (np.linalg.norm(template) * np.linalg.norm(chroma_frame) + 1e-8)
+                similarities[note + chord_name] = cos_sim
+                
+        # Only check complex chords if no good matches (similarity < 0.75)
+        if not similarities or max(similarities.values()) < 0.75:
+            other_templates = {
+                k: v for k, v in templates.items() 
+                if k not in ['', 'm', '7', 'm7']
+            }
+            for chord_name, template in other_templates.items():
+                cos_sim = np.dot(template, chroma_frame) / (np.linalg.norm(template) * np.linalg.norm(chroma_frame) + 1e-8)
+                similarities[note + chord_name] = cos_sim
         
         # Find best match
         best_match = max(similarities.items(), key=lambda x: x[1])
@@ -438,29 +449,48 @@ def post_process_enhanced(chords, min_duration=0.3, key_signature=None):
     if not chords:
         return []
     
-    # Remove very short chords and apply musical logic
-    filtered_chords = []
-    i = 0
-    while i < len(chords):
-        current_time, current_chord = chords[i]
-        
-        # Find duration
-        j = i + 1
-        while j < len(chords) and chords[j][1] == current_chord:
-            j += 1
-        
-        if j < len(chords):
-            duration = chords[j][0] - current_time
+    # Merge neighboring identical chords
+    merged_chords = []
+    current_chord = chords[0][1]
+    start_time = chords[0][0]
+    end_time = start_time
+    
+    for t, chord in chords[1:]:
+        if chord == current_chord and t - end_time < 0.2:  # Merge if gap is small
+            end_time = t
         else:
-            duration = float('inf')
+            if end_time - start_time >= min_duration:  # Only keep sufficiently long chords
+                merged_chords.append((start_time, current_chord))
+            current_chord = chord
+            start_time = t
+        end_time = t
+    
+    # Add last chord if valid
+    if end_time - start_time >= min_duration:
+        merged_chords.append((start_time, current_chord))
         
-        # Keep chord if it meets criteria
-        if (duration >= min_duration or 
-            is_harmonically_important(current_chord, chords, i) or
-            is_transition_chord(current_chord, chords, i)):
-            filtered_chords.append((current_time, current_chord))
+    # Further filtering based on key context
+    filtered_chords = []
+    for i, (t, chord) in enumerate(merged_chords):
+        keep = True
         
-        i = j
+        # Skip very short chords unless they're important or between different chords
+        if i > 0 and i < len(merged_chords)-1:
+            prev_chord = merged_chords[i-1][1]
+            next_chord = merged_chords[i+1][1]
+            
+            # Remove repeated chords in sequence (A -> A -> B becomes A -> B)
+            if chord == prev_chord and chord == next_chord:
+                keep = False
+                
+            # Remove single-occurrence transition chords
+            elif chord != prev_chord and chord != next_chord:
+                duration = merged_chords[i+1][0] - t
+                if duration < min_duration and not is_harmonically_important(chord, merged_chords, i):
+                    keep = False
+        
+        if keep:
+            filtered_chords.append((t, chord))
     
     return filtered_chords
 
