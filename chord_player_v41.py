@@ -1292,15 +1292,16 @@ class EnhancedChordPlayer(QWidget):
         """
         self.tempo_label.setStyleSheet(tempo_style)
         
-        def apply_preset(self, preset_name):
-        """Apply predefined analysis presets"""
+    def apply_preset(self, preset_name):
+        """Apply predefined analysis presets (fast, balanced, accurate)."""
+        preset_name = (preset_name or '').lower()
         if preset_name == 'fast':
             self.performance_cb.setChecked(True)
             self.multi_feature_cb.setChecked(False)
             self.harmonic_cb.setChecked(False)
             self.smoothing_combo.setCurrentText('gaussian')
-            self.threshold_spin.setValue(0.3)
-            self.min_duration_spin.setValue(0.5)
+            self.threshold_spin.setValue(0.30)
+            self.min_duration_spin.setValue(0.50)
             self.max_chord_types_spin.setValue(30)
         elif preset_name == 'balanced':
             self.performance_cb.setChecked(False)
@@ -1308,22 +1309,27 @@ class EnhancedChordPlayer(QWidget):
             self.harmonic_cb.setChecked(True)
             self.smoothing_combo.setCurrentText('adaptive')
             self.threshold_spin.setValue(0.25)
-            self.min_duration_spin.setValue(0.3)
+            self.min_duration_spin.setValue(0.30)
             self.max_chord_types_spin.setValue(80)
         elif preset_name == 'accurate':
             self.performance_cb.setChecked(False)
             self.multi_feature_cb.setChecked(True)
             self.harmonic_cb.setChecked(True)
             self.smoothing_combo.setCurrentText('adaptive')
-            self.threshold_spin.setValue(0.2)
-            self.min_duration_spin.setValue(0.2)
+            self.threshold_spin.setValue(0.20)
+            self.min_duration_spin.setValue(0.20)
             self.max_chord_types_spin.setValue(150)
-        
+        else:
+            QMessageBox.information(self, "Presets", f"Unknown preset: {preset_name}")
+            return
+
         self.save_settings()
-        QMessageBox.information(self, "Preset Applied", 
-                              f"'{preset_name.title()}' preset has been applied.\n"
-                              f"Settings will be used for the next analysis.")
-        
+        QMessageBox.information(
+            self, "Preset Applied",
+            f"'{preset_name.title()}' preset has been applied.\n"
+            f"Settings will be used for the next analysis."
+        )
+
     def load_settings(self):
         """Load user settings with new parameters"""
         self.performance_cb.setChecked(self.settings.value("performance_mode", False, type=bool))
