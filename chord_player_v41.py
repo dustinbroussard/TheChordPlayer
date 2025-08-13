@@ -1988,6 +1988,7 @@ class EnhancedChordPlayer(QWidget):
             "eleventh": {"border": "#673AB7", "bg_start": "#EDE7F6", "bg_end": "#D1C4E9", "color": "#512DA8"},
             "thirteenth": {"border": "#3F51B5", "bg_start": "#E8EAF6", "bg_end": "#C5CAE9", "color": "#303F9F"},
             "diminished": {"border": "#795548", "bg_start": "#EFEBE9", "bg_end": "#D7CCC8", "color": "#5D4037"},
+            }
 import time
 import os
 import hashlib
