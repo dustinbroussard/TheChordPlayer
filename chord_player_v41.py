@@ -3285,7 +3285,34 @@ class EnhancedChordPlayer(QWidget):
         
         
         def apply_preset(self, preset_name):
-        """Apply predefined analysis presets"""
+            """Apply predefined analysis presets"""
+            preset_name = (preset_name or '').lower()
+            if preset_name == 'fast':
+                self.performance_cb.setChecked(True)
+                self.multi_feature_cb.setChecked(False)
+                self.harmonic_cb.setChecked(False)
+                self.smoothing_combo.setCurrentText('gaussian')
+                self.threshold_spin.setValue(0.3)
+                self.min_duration_spin.setValue(0.5)
+                self.max_chord_types_spin.setValue(30)
+            elif preset_name == 'balanced':
+                self.performance_cb.setChecked(False)
+                self.multi_feature_cb.setChecked(True)
+                self.harmonic_cb.setChecked(True)
+                self.smoothing_combo.setCurrentText('adaptive')
+                self.threshold_spin.setValue(0.25)
+                self.min_duration_spin.setValue(0.3)
+                self.max_chord_types_spin.setValue(80)
+            elif preset_name == 'accurate':
+                self.performance_cb.setChecked(False)
+                self.multi_feature_cb.setChecked(True)
+                self.harmonic_cb.setChecked(True)
+                self.smoothing_combo.setCurrentText('adaptive')
+                self.threshold_spin.setValue(0.2)
+                self.min_duration_spin.setValue(0.2)
+                self.max_chord_types_spin.setValue(150)
+            
+            self.save_settings()
         if preset_name == 'fast':
             self.performance_cb.setChecked(True)
             self.multi_feature_cb.setChecked(False)
