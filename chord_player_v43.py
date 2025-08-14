@@ -14,13 +14,14 @@ Run:
 """
 
 from __future__ import annotations
-import sys, os, time, json, hashlib, shutil
+import sys, os, time, json, hashlib, shutil, threading
 from typing import Callable, Dict, List, Sequence, Tuple, Optional
 
 import numpy as np
 import librosa
 import soundfile as sf
 from scipy.ndimage import median_filter, gaussian_filter1d
+from scipy.signal import iirpeak
 from sklearn.preprocessing import normalize
 
 # Qt imports (optional)
@@ -31,7 +32,7 @@ try:  # pragma: no cover - optional GUI dependency
         QTextEdit, QGroupBox, QGridLayout, QComboBox, QDoubleSpinBox, QSplitter,
         QListWidget, QFrame, QScrollArea, QSlider
     )
-    from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal, QObject, QSettings
+    from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal, pyqtSlot, QObject, QSettings
     from PyQt6.QtGui import QFont, QPixmap, QPalette, QColor
     QT_AVAILABLE = True
 except Exception:  # pragma: no cover - headless environments
@@ -132,6 +133,13 @@ except Exception:  # pragma: no cover - headless environments
         def emit(self, *args, **kwargs):
             pass
 
+    class pyqtSlot:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, func):
+            return func
+
     class QSettings:  # type: ignore
         def __init__(self, *args, **kwargs):
             pass
@@ -151,6 +159,10 @@ except Exception:  # pragma: no cover - headless environments
 
     class QColor:  # type: ignore
         pass
+
+if QT_AVAILABLE:
+    from PyQt6 import QtCore
+    import pyqtgraph as pg
 
 # Audio playback
 try:
@@ -225,6 +237,189 @@ def format_time(seconds: float) -> str:
     m = int(seconds // 60)
     s = int(round(seconds - m*60))
     return f"{m:02d}:{s:02d}"
+
+# ---- EQ ENGINE -------------------------------------------------------------
+class BiquadPeaking:
+    def __init__(self, fs, f0, gain_db=0.0, Q=1.0):
+        self.fs = fs
+        self.f0 = f0
+        self.Q = Q
+        self.set_gain(gain_db)
+        self.z1 = 0.0
+        self.z2 = 0.0
+
+    def set_gain(self, gain_db):
+        A = 10 ** (gain_db / 40.0)
+        w0 = 2 * np.pi * self.f0 / self.fs
+        alpha = np.sin(w0) / (2 * self.Q)
+
+        b0 = 1 + alpha * A
+        b1 = -2 * np.cos(w0)
+        b2 = 1 - alpha * A
+        a0 = 1 + alpha / A
+        a1 = -2 * np.cos(w0)
+        a2 = 1 - alpha / A
+
+        self.b0 = b0 / a0
+        self.b1 = b1 / a0
+        self.b2 = b2 / a0
+        self.a1 = a1 / a0
+        self.a2 = a2 / a0
+
+    def process(self, x):
+        y = np.empty_like(x)
+        z1, z2 = self.z1, self.z2
+        b0, b1, b2, a1, a2 = self.b0, self.b1, self.b2, self.a1, self.a2
+        for i, xn in enumerate(x):
+            yn = b0 * xn + z1
+            z1 = b1 * xn - a1 * yn + z2
+            z2 = b2 * xn - a2 * yn
+            y[i] = yn
+        self.z1, self.z2 = z1, z2
+        return y
+
+class FiveBandEQ:
+    def __init__(self, fs):
+        self.fs = fs
+        self.bands = [
+            ("60", BiquadPeaking(fs, 60.0, 0.0, Q=1.0)),
+            ("230", BiquadPeaking(fs, 230.0, 0.0, Q=1.0)),
+            ("910", BiquadPeaking(fs, 910.0, 0.0, Q=1.0)),
+            ("4.1k", BiquadPeaking(fs, 4100.0, 0.0, Q=1.0)),
+            ("14k", BiquadPeaking(fs, 14000.0, 0.0, Q=0.9)),
+        ]
+
+    def set_gain(self, idx, gain_db):
+        self.bands[idx][1].set_gain(gain_db)
+
+    def process(self, x):
+        y = x
+        for _, biq in self.bands:
+            y = biq.process(y)
+        return np.clip(y, -1.0, 1.0)
+
+# ---- REALTIME AUDIO STREAM -------------------------------------------------
+try:
+    import sounddevice as sd
+    HAVE_SD = True
+except Exception:  # pragma: no cover - optional dependency
+    HAVE_SD = False
+
+class RTPlayer:
+    def __init__(self, fs=44100, blocksize=1024, channels=1, eq=None, on_visual=None):
+        self.fs = fs
+        self.blocksize = blocksize
+        self.channels = channels
+        self.eq = eq
+        self.on_visual = on_visual
+        self.buffer = np.zeros(0, dtype=np.float32)
+        self.lock = threading.Lock()
+        self.stream = None
+        self.gain = 1.0
+
+    def load(self, mono_float32_pcm):
+        with self.lock:
+            self.buffer = mono_float32_pcm.astype(np.float32)
+
+    def start(self):
+        if not HAVE_SD:
+            raise RuntimeError("sounddevice not available")
+        if self.stream:
+            self.stop()
+        self.pos = 0
+
+        def cb(outdata, frames, time, status):
+            if status:
+                pass
+            with self.lock:
+                end = min(self.pos + frames, len(self.buffer))
+                chunk = self.buffer[self.pos:end]
+                self.pos = end
+            if len(chunk) < frames:
+                pad = np.zeros(frames - len(chunk), dtype=np.float32)
+                chunk = np.concatenate([chunk, pad])
+
+            if self.eq:
+                chunk = self.eq.process(chunk)
+
+            if self.on_visual:
+                self.on_visual(chunk.copy())
+
+            chunk *= self.gain
+            out = np.tile(chunk.reshape(-1, 1), (1, self.channels))
+            outdata[:] = out
+
+        self.stream = sd.OutputStream(
+            samplerate=self.fs,
+            channels=self.channels,
+            blocksize=self.blocksize,
+            dtype="float32",
+            callback=cb,
+        )
+        self.stream.start()
+
+    def stop(self):
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+
+if QT_AVAILABLE:
+    # ---- VISUALIZER --------------------------------------------------------
+    class VisualizerWidget(QWidget):
+        def __init__(self, fs, parent=None):
+            super().__init__(parent)
+            self.fs = fs
+            layout = QVBoxLayout(self)
+            self.wave = pg.PlotWidget()
+            self.wave.setYRange(-1.05, 1.05)
+            self.wave_curve = self.wave.plot(pen=pg.mkPen(width=1))
+            self.spec = pg.PlotWidget()
+            self.spec.setLogMode(x=False, y=True)
+            self.spec_curve = self.spec.plot(stepMode=True, fillLevel=-120)
+            layout.addWidget(self.wave)
+            layout.addWidget(self.spec)
+            self._buf = np.zeros(2048, dtype=np.float32)
+
+        @pyqtSlot(object)
+        def push_audio(self, chunk):
+            L = len(chunk)
+            if L >= len(self._buf):
+                self._buf[:] = chunk[-len(self._buf) :]
+            else:
+                self._buf = np.roll(self._buf, -L)
+                self._buf[-L:] = chunk
+            self.wave_curve.setData(self._buf)
+            w = np.hanning(len(chunk))
+            Y = np.fft.rfft(chunk * w)
+            mag_db = 20 * np.log10(np.maximum(1e-7, np.abs(Y)))
+            freqs = np.fft.rfftfreq(len(chunk), d=1.0 / self.fs)
+            bins = 60
+            idx = np.linspace(1, len(freqs) - 1, bins).astype(int)
+            self.spec_curve.setData(freqs[idx], mag_db[idx])
+
+    # ---- EQ CONTROL PANEL --------------------------------------------------
+    class EQPanel(QWidget):
+        gainChanged = pyqtSignal(int, float)
+
+        def __init__(self, labels=("60", "230", "910", "4.1k", "14k"), parent=None):
+            super().__init__(parent)
+            layout = QHBoxLayout(self)
+            self.sliders = []
+            for i, lab in enumerate(labels):
+                vbox = QVBoxLayout()
+                lbl = QLabel(lab)
+                s = QSlider(Qt.Orientation.Vertical)
+                s.setRange(-12 * 2, 12 * 2)
+                s.setValue(0)
+                s.valueChanged.connect(lambda val, idx=i: self._emit(idx, val / 2.0))
+                vbox.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignHCenter)
+                vbox.addWidget(s)
+                layout.addLayout(vbox)
+                self.sliders.append(s)
+
+        def _emit(self, idx, gain_db):
+            self.gainChanged.emit(idx, gain_db)
 
 # --------------- Audio Playback ---------------
 class AudioPlayer:
@@ -695,8 +890,19 @@ class App(QWidget):
         self.current_file_path: Optional[str] = None
         self.analysis_thread: Optional[QThread] = None
         self.worker: Optional[ChordAnalysisWorker] = None
-        
-        # Audio player
+
+        # Realtime playback
+        self.audio_mono_float32: Optional[np.ndarray] = None
+        self.fs: int = 44100
+        self.player: Optional[RTPlayer] = None
+        self.eq: Optional[FiveBandEQ] = None
+        self.vis: Optional[VisualizerWidget] = None
+        self.eq_panel: Optional[EQPanel] = None
+        self.visualizer_container: Optional[QWidget] = None
+        self.rt_playing: bool = False
+        self.use_rt_player: bool = HAVE_SD and QT_AVAILABLE
+
+        # Audio player fallback
         self.audio_player = AudioPlayer()
         self.playback_timer = QTimer(self)
         self.playback_timer.timeout.connect(self.update_playback_position)
@@ -708,14 +914,14 @@ class App(QWidget):
 
     def init_ui(self):
         main = QVBoxLayout(self)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        main.addWidget(splitter)
-        
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        main.addWidget(self.splitter)
+
         left = self.build_left()
         right = self.build_right()
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setSizes([750, 550])
+        self.splitter.addWidget(left)
+        self.splitter.addWidget(right)
+        self.splitter.setSizes([750, 550])
         
         self.create_status_bar(main)
         
@@ -1256,7 +1462,9 @@ class App(QWidget):
     def update_volume(self):
         volume = self.volume_slider.value()
         self.volume_label.setText(f"{volume}%")
-        if PYGAME_AVAILABLE and self.audio_player.pygame_initialized:
+        if self.use_rt_player and self.player:
+            self.player.gain = volume / 100.0
+        elif PYGAME_AVAILABLE and self.audio_player.pygame_initialized:
             try:
                 pygame.mixer.music.set_volume(volume / 100.0)
             except Exception:
@@ -1266,14 +1474,26 @@ class App(QWidget):
         if not self.current_file_path:
             QMessageBox.information(self, "Playback", "No audio file loaded.")
             return
-        
+        if self.use_rt_player and self.player:
+            try:
+                self.player.load(self.audio_mono_float32)
+                self.player.start()
+                self.btn_play.setText("⏸️ Playing")
+                self.btn_pause.setEnabled(False)
+                self.btn_stop.setEnabled(True)
+                self.playback_timer.start(100)
+
+                self.current_playback_time = 0.0
+                self.rt_playing = True
+                return
+            except Exception as e:
+                QMessageBox.warning(self, "Playback Error", f"Realtime audio failed:\n{e}")
         if not PYGAME_AVAILABLE:
             QMessageBox.warning(
-                self, "Playback Error", 
-                "Audio playback requires pygame. Install with:\npip install pygame"
+                self, "Playback Error",
+                "Audio playback requires pygame. Install with:\npip install pygame",
             )
             return
-        
         if self.audio_player.is_playing and self.audio_player.is_paused:
             self.audio_player.unpause()
             self.btn_play.setText("▶️ Play")
@@ -1292,6 +1512,8 @@ class App(QWidget):
                 QMessageBox.warning(self, "Playback Error", "Failed to load audio file for playback.")
 
     def toggle_pause(self):
+        if self.use_rt_player:
+            return
         if self.audio_player.is_playing:
             if self.audio_player.is_paused:
                 self.audio_player.unpause()
@@ -1301,7 +1523,11 @@ class App(QWidget):
                 self.btn_pause.setText("▶️ Resume")
 
     def stop_playback(self):
-        self.audio_player.stop()
+        if self.use_rt_player and self.player:
+            self.player.stop()
+            self.rt_playing = False
+        else:
+            self.audio_player.stop()
         self.playback_timer.stop()
         self.current_playback_time = 0.0
         self.btn_play.setText("▶️ Play")
@@ -1310,7 +1536,12 @@ class App(QWidget):
         self.btn_stop.setEnabled(False)
 
     def update_playback_position(self):
-        if self.audio_player.is_playing and not self.audio_player.is_paused:
+        if self.use_rt_player:
+            if self.rt_playing:
+                self.current_playback_time += 0.1
+                if self.current_playback_time >= self.audio_duration:
+                    self.stop_playback()
+        elif self.audio_player.is_playing and not self.audio_player.is_paused:
             self.current_playback_time += 0.1
             if self.current_playback_time >= self.audio_duration:
                 self.stop_playback()
@@ -1329,12 +1560,49 @@ class App(QWidget):
         self.settings.setValue("last_dir", os.path.dirname(file_path))
         
         try:
-            y, sr = librosa.load(file_path, sr=SR, mono=True)
-            self.audio_duration = len(y)/sr
+            raw, sr_raw = librosa.load(file_path, sr=None, mono=True)
+            self.audio_duration = len(raw) / sr_raw
             self.current_file_path = file_path
         except Exception as e:
             QMessageBox.critical(self, "Load Error", f"Could not read audio file.\n\n{e}")
             return
+
+        peak = np.max(np.abs(raw)) or 1.0
+        self.audio_mono_float32 = (0.8 * raw / peak).astype(np.float32)
+        self.fs = sr_raw
+
+        if self.use_rt_player:
+            self.eq = FiveBandEQ(self.fs)
+            self.vis = VisualizerWidget(self.fs)
+            self.eq_panel = EQPanel()
+
+            def on_visual(chunk):
+                QtCore.QMetaObject.invokeMethod(
+                    self.vis,
+                    "push_audio",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(object, chunk),
+                )
+
+            self.player = RTPlayer(fs=self.fs, eq=self.eq, on_visual=on_visual)
+            self.eq_panel.gainChanged.connect(lambda idx, g: self.eq.set_gain(idx, g))
+
+            if self.visualizer_container is None:
+                vlayout = QVBoxLayout()
+                vlayout.addWidget(self.vis)
+                vlayout.addWidget(self.eq_panel)
+                self.visualizer_container = QWidget()
+                self.visualizer_container.setLayout(vlayout)
+                self.splitter.addWidget(self.visualizer_container)
+            else:
+                layout = self.visualizer_container.layout()
+                while layout.count():
+                    item = layout.takeAt(0)
+                    w = item.widget()
+                    if w is not None:
+                        w.setParent(None)
+                layout.addWidget(self.vis)
+                layout.addWidget(self.eq_panel)
 
         # Update UI
         filename = os.path.basename(file_path)
