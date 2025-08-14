@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import librosa
 import sounddevice as sd
+import mido
+from mido import MidiFile, MidiTrack, Message
 from scipy import signal
 from scipy.ndimage import median_filter, gaussian_filter1d
 from sklearn.preprocessing import normalize
@@ -244,6 +246,14 @@ def extract_enhanced_features(y, sr=SR):
     
     features = {}
     
+    # Add tempo estimation
+    try:
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr, hop_length=HOP_LENGTH)
+        features['tempo'] = tempo
+    except Exception as e:
+        print(f"[WARNING] Tempo detection failed: {e}")
+        features['tempo'] = 120.0  # Fallback BPM
+    
     # Multi-resolution chroma with CQT (primary feature)
     features['chroma_cqt'] = librosa.feature.chroma_cqt(
         y=y, sr=sr, hop_length=HOP_LENGTH, fmin=librosa.note_to_hz('C1'),
@@ -285,8 +295,9 @@ def apply_intelligent_smoothing(chroma_sequence, features=None, method='adaptive
             centroid = features['spectral_centroid'][0]
             centroid_diff = np.abs(np.diff(centroid))
             
-            # Simplified adaptive sigma calculation
-            sigma_base = 2.0
+            # Enhanced with tempo: Faster tempo -> less smoothing
+            tempo = features.get('tempo', 120)
+            sigma_base = 2.0 * (120 / max(tempo, 60))  # Scale sigma inversely
             stability = 1.0 / (1.0 + centroid_diff * 1000)
             sigma_adaptive = sigma_base * (0.5 + stability)
             
@@ -535,8 +546,10 @@ def detect_chords_enhanced(path, progress_callback=None, status_callback=None, *
         status_callback("Post-processing results...")
     
     # Enhanced post-processing
-    chords = post_process_enhanced(chords, settings['min_chord_duration'], key_signature)
+    chords, complexity = post_process_enhanced(chords, settings['min_chord_duration'], key_signature)
     analysis_stats['chord_changes'] = len(chords)
+    analysis_stats['harmonic_complexity'] = complexity
+    analysis_stats['estimated_tempo'] = features.get('tempo', 120)
     
     # Cache results
     try:
@@ -608,7 +621,9 @@ def post_process_enhanced(chords, min_duration=0.3, key_signature=None):
             filtered_chords.append((t, chord))
     
     perf_monitor.end_timer("post_processing")
-    return filtered_chords
+    # Calculate harmonic complexity (unique chords ratio)
+    complexity = len(set(c[1] for c in filtered_chords)) / max(len(filtered_chords), 1)
+    return filtered_chords, complexity
 
 def is_harmonically_important(chord, sequence, index):
     """Enhanced harmonic importance detection"""
@@ -1824,6 +1839,76 @@ class EnhancedChordPlayer(QWidget):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to clear cache:\n{str(e)}")
                 
+    def export_results(self, format_type):
+        """Export analysis results in various formats"""
+        if not self.chords:
+            QMessageBox.warning(self, "Export Error", "No analysis results to export.")
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, 
+            f"Export as {format_type.upper()}", 
+            "", 
+            f"{format_type.upper()} Files (*.{format_type})"
+        )
+        if not file_path:
+            return
+        
+        try:
+            if format_type == 'txt':
+                with open(file_path, 'w') as f:
+                    f.write(f"Key: {self.key_signature}\n")
+                    f.write(f"Tempo: {self.analysis_stats.get('estimated_tempo', 0):.1f} BPM\n\n")
+                    for t, chord in self.chords:
+                        f.write(f"{t:.2f}s: {chord}\n")
+                        
+            elif format_type == 'json':
+                data = {
+                    'key_signature': self.key_signature,
+                    'tempo': self.analysis_stats.get('estimated_tempo', 0),
+                    'chords': self.chords,
+                    'stats': self.analysis_stats
+                }
+                with open(file_path, 'w') as f:
+                    json.dump(data, f, indent=4)
+                    
+            elif format_type == 'midi':
+                mid = MidiFile()
+                track = MidiTrack()
+                mid.tracks.append(track)
+                
+                prev_time = 0
+                ticks_per_beat = 480  # Standard resolution
+                tempo = int(60000000 / self.analysis_stats.get('estimated_tempo', 120))  # Microsecs per beat
+                track.append(Message('set_tempo', tempo=tempo, time=0))
+                
+                for t, chord in self.chords:
+                    if chord == "N.C.": 
+                        continue
+                    
+                    # Parse chord to MIDI notes (simplified: root + intervals)
+                    root_note = NOTE_NAMES.index(chord[0]) + 60  # Middle C range
+                    intervals = CHORD_DEFS.get(chord[1:], [0, 4, 7])  # Default major
+                    notes = [root_note + i for i in intervals]
+                    
+                    delta_ticks = int((t - prev_time) * ticks_per_beat)
+                    for note in notes:
+                        track.append(Message('note_on', note=note, velocity=64, time=delta_ticks))
+                    delta_ticks = 0  # Subsequent notes at same time
+                    
+                    # Hold for min duration (or until next)
+                    hold_ticks = int(self.settings.value("min_duration", 0.3) * ticks_per_beat)
+                    for note in notes:
+                        track.append(Message('note_off', note=note, velocity=0, time=hold_ticks))
+                    
+                    prev_time = t
+                
+                mid.save(file_path)
+            
+            QMessageBox.information(self, "Export Success", f"Results exported to {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export: {str(e)}")
+
     def show_cache_info(self):
         """Show detailed cache information"""
         self.update_cache_info()
