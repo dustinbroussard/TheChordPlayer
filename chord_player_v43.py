@@ -14,7 +14,7 @@ Run:
 """
 
 from __future__ import annotations
-import sys, os, time, json, hashlib, shutil, threading
+import sys, os, time, json, hashlib, shutil, threading, tempfile, subprocess
 from typing import Callable, Dict, List, Sequence, Tuple, Optional
 
 import numpy as np
@@ -30,7 +30,7 @@ try:  # pragma: no cover - optional GUI dependency
         QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QFileDialog,
         QMessageBox, QHBoxLayout, QCheckBox, QSpinBox, QProgressBar, QTabWidget,
         QTextEdit, QGroupBox, QGridLayout, QComboBox, QDoubleSpinBox, QSplitter,
-        QListWidget, QFrame, QScrollArea, QSlider
+        QListWidget, QFrame, QScrollArea, QSlider, QFormLayout
     )
     from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal, pyqtSlot, QObject, QSettings
     from PyQt6.QtGui import QFont, QPixmap, QPalette, QColor
@@ -118,6 +118,14 @@ except Exception:  # pragma: no cover - headless environments
 
     class QSlider:  # type: ignore
         pass
+
+    class QFormLayout(QVBoxLayout):  # type: ignore
+        def addRow(self, *args, **kwargs):
+            pass
+        def rowCount(self):
+            return 0
+        def removeRow(self, *args, **kwargs):
+            pass
 
     class QTimer:  # type: ignore
         def __init__(self, *args, **kwargs):
@@ -237,6 +245,55 @@ def format_time(seconds: float) -> str:
     m = int(seconds // 60)
     s = int(round(seconds - m*60))
     return f"{m:02d}:{s:02d}"
+
+# ----------------- STEMS ----------------------------------------------------
+class StemSeparator:
+    """Two engines: HPSS (fast) and Demucs (quality)."""
+
+    def __init__(self, fs=44100):
+        self.fs = fs
+
+    def hpss(self, y: np.ndarray, sr: int):
+        """Returns dict with 'instrumental' and 'drums'."""
+        y_mono = librosa.to_mono(y) if y.ndim > 1 else y
+        H, P = librosa.effects.hpss(y_mono)
+        stems = {
+            "instrumental": H.astype(np.float32),
+            "drums": P.astype(np.float32),
+        }
+        return stems, sr
+
+    def demucs(self, y: np.ndarray, sr: int, mode: str = "two_stems"):
+        """Run Demucs separation."""
+        tmpdir = tempfile.mkdtemp(prefix="stems_")
+        in_wav = os.path.join(tmpdir, "input.wav")
+        if y.ndim == 1:
+            y = np.stack([y, y], axis=0)
+        sf.write(in_wav, y.T.astype(np.float32), sr)
+        outdir = os.path.join(tmpdir, "out")
+        os.makedirs(outdir, exist_ok=True)
+        cmd = [
+            "python", "-m", "demucs.separate", "-d", "cpu", "-n", "htdemucs", "--out", outdir, in_wav
+        ]
+        if mode == "two_stems":
+            cmd.insert(5, "--two-stems=vocals")
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except Exception as e:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise RuntimeError(f"Demucs failed: {e}")
+        model_dir = next(p for p in os.listdir(outdir))
+        song_dir = os.path.join(outdir, model_dir, "input")
+        stems = {}
+        for fname in os.listdir(song_dir):
+            if not fname.endswith(".wav"):
+                continue
+            name = os.path.splitext(fname)[0]
+            data, srr = sf.read(os.path.join(song_dir, fname), dtype="float32", always_2d=True)
+            stems[name] = data.T
+        key_map = {"vocals": "vocals", "no_vocals": "instrumental", "drums": "drums", "bass": "bass", "other": "other"}
+        normalized = {key_map.get(k, k): v for k, v in stems.items()}
+        return normalized, srr, tmpdir
 
 # ---- EQ ENGINE -------------------------------------------------------------
 class BiquadPeaking:
@@ -420,6 +477,43 @@ if QT_AVAILABLE:
 
         def _emit(self, idx, gain_db):
             self.gainChanged.emit(idx, gain_db)
+
+    class StemsPanel(QWidget):
+        requestSeparate = pyqtSignal(str)
+        exportStem = pyqtSignal(str)
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            layout = QVBoxLayout(self)
+            row = QHBoxLayout()
+            self.btn_hpss = QPushButton("HPSS (fast)")
+            self.btn_two = QPushButton("Demucs: Vocals/Inst")
+            self.btn_four = QPushButton("Demucs: 4-Stem")
+            for b in (self.btn_hpss, self.btn_two, self.btn_four):
+                row.addWidget(b)
+            layout.addLayout(row)
+            self.btn_hpss.clicked.connect(lambda: self.requestSeparate.emit("hpss"))
+            self.btn_two.clicked.connect(lambda: self.requestSeparate.emit("two"))
+            self.btn_four.clicked.connect(lambda: self.requestSeparate.emit("four"))
+            self.mixer = QFormLayout()
+            self._sliders = {}
+            box = QGroupBox("Stem Mixer (dB)")
+            box.setLayout(self.mixer)
+            layout.addWidget(box)
+
+        def set_stems(self, stems_keys):
+            while self.mixer.rowCount():
+                self.mixer.removeRow(0)
+            self._sliders.clear()
+            for k in stems_keys:
+                s = QSlider(Qt.Orientation.Horizontal)
+                s.setRange(-24 * 2, 12 * 2)
+                s.setValue(0)
+                self.mixer.addRow(QLabel(k), s)
+                self._sliders[k] = s
+
+        def gains_db(self):
+            return {k: s.value() / 2.0 for k, s in self._sliders.items()}
 
 # --------------- Audio Playback ---------------
 class AudioPlayer:
@@ -898,9 +992,15 @@ class App(QWidget):
         self.eq: Optional[FiveBandEQ] = None
         self.vis: Optional[VisualizerWidget] = None
         self.eq_panel: Optional[EQPanel] = None
+        self.stems_panel: Optional[StemsPanel] = None
         self.visualizer_container: Optional[QWidget] = None
         self.rt_playing: bool = False
         self.use_rt_player: bool = HAVE_SD and QT_AVAILABLE
+
+        self.separator = StemSeparator()
+        self.current_stems: Optional[Dict[str, np.ndarray]] = None
+        self.current_stems_sr: Optional[int] = None
+        self.demucs_tmpdir: Optional[str] = None
 
         # Audio player fallback
         self.audio_player = AudioPlayer()
@@ -1476,7 +1576,14 @@ class App(QWidget):
             return
         if self.use_rt_player and self.player:
             try:
-                self.player.load(self.audio_mono_float32)
+                if self.current_stems:
+                    mix, srr = self._mixdown_from_stems()
+                    if mix is not None:
+                        mono = np.mean(mix, axis=0)
+                        self.player.fs = srr
+                        self.player.load(mono)
+                else:
+                    self.player.load(self.audio_mono_float32)
                 self.player.start()
                 self.btn_play.setText("⏸️ Playing")
                 self.btn_pause.setEnabled(False)
@@ -1546,6 +1653,70 @@ class App(QWidget):
             if self.current_playback_time >= self.audio_duration:
                 self.stop_playback()
 
+    def _mixdown_from_stems(self):
+        gains = self.stems_panel.gains_db() if self.stems_panel else {}
+        if not self.current_stems:
+            return None, None
+        L = max(v.shape[1] for v in self.current_stems.values())
+        mix = np.zeros((2, L), dtype=np.float32)
+        for name, buf in self.current_stems.items():
+            g = 10 ** (gains.get(name, 0.0) / 20.0)
+            if buf.shape[1] < L:
+                pad = np.zeros((buf.shape[0], L - buf.shape[1]), dtype=np.float32)
+                b = np.concatenate([buf, pad], axis=1)
+            else:
+                b = buf[:, :L]
+            mix += g * b
+        mx = np.max(np.abs(mix)) or 1.0
+        if mx > 0.98:
+            mix = 0.98 * mix / mx
+        return mix, self.current_stems_sr
+
+    def _on_separate(self, kind: str):
+        if self.audio_mono_float32 is None:
+            return
+        y = self.audio_mono_float32
+        sr = self.fs
+        if kind == "hpss":
+            stems, srr = self.separator.hpss(y, sr)
+            fixed = {k: (np.stack([v, v], axis=0) if v.ndim == 1 else v) for k, v in stems.items()}
+            self.current_stems = fixed
+            self.current_stems_sr = srr
+            self.demucs_tmpdir = None
+        else:
+            mode = "two_stems" if kind == "two" else "four_stems"
+            stems, srr, tdir = self.separator.demucs(y, sr, mode=mode)
+            self.current_stems = stems
+            self.current_stems_sr = srr
+            self.demucs_tmpdir = tdir
+        if self.stems_panel:
+            self.stems_panel.set_stems(sorted(self.current_stems.keys()))
+        if "instrumental" in self.current_stems:
+            try:
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                sf.write(tmp.name, self.current_stems["instrumental"].T, self.current_stems_sr)
+                tmp.close()
+                chords, key_sig, stats = detect_chords(tmp.name)
+                os.unlink(tmp.name)
+                self.chords = chords
+                self.key_signature = key_sig
+                self.stats = stats
+                self.update_chord_list_display()
+                self.key_label.setText(f"Key: {key_sig}")
+                key_conf = int(round(100 * stats.get('key_confidence', 0.0)))
+                self.conf_label.setText(f"Confidence: {key_conf}%")
+                tempo = int(round(stats.get('estimated_tempo', 120)))
+                self.tempo_label.setText(f"♩ = {tempo} BPM")
+            except Exception as e:
+                print(f"[STEMS] analysis failed: {e}")
+
+    def export_current_stems(self, out_dir: str):
+        if not self.current_stems or not self.current_stems_sr:
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        for name, buf in self.current_stems.items():
+            sf.write(os.path.join(out_dir, f"{name}.wav"), buf.T, self.current_stems_sr)
+
     # Analysis Methods
     def load_audio(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1575,6 +1746,8 @@ class App(QWidget):
             self.eq = FiveBandEQ(self.fs)
             self.vis = VisualizerWidget(self.fs)
             self.eq_panel = EQPanel()
+            self.stems_panel = StemsPanel()
+            self.stems_panel.requestSeparate.connect(self._on_separate)
 
             def on_visual(chunk):
                 QtCore.QMetaObject.invokeMethod(
@@ -1591,6 +1764,7 @@ class App(QWidget):
                 vlayout = QVBoxLayout()
                 vlayout.addWidget(self.vis)
                 vlayout.addWidget(self.eq_panel)
+                vlayout.addWidget(self.stems_panel)
                 self.visualizer_container = QWidget()
                 self.visualizer_container.setLayout(vlayout)
                 self.splitter.addWidget(self.visualizer_container)
@@ -1603,6 +1777,7 @@ class App(QWidget):
                         w.setParent(None)
                 layout.addWidget(self.vis)
                 layout.addWidget(self.eq_panel)
+                layout.addWidget(self.stems_panel)
 
         # Update UI
         filename = os.path.basename(file_path)
