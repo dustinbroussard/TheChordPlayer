@@ -3401,6 +3401,11 @@ class EnhancedChordPlayer(QWidget):
                               f"'{preset_name.title()}' preset has been applied.\n"
                               f"Settings will be used for the next analysis.")
         
+        self.save_settings()
+        QMessageBox.information(self, "Preset Applied", 
+                              f"'{preset_name.title()}' preset has been applied.\n"
+                              f"Settings will be used for the next analysis.")
+        
     def load_settings(self):
         """Load user settings with new parameters"""
         self.performance_cb.setChecked(self.settings.value("performance_mode", False, type=bool))
