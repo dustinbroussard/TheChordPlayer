@@ -23,15 +23,134 @@ import soundfile as sf
 from scipy.ndimage import median_filter, gaussian_filter1d
 from sklearn.preprocessing import normalize
 
-# Qt imports
-from PyQt6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QFileDialog,
-    QMessageBox, QHBoxLayout, QCheckBox, QSpinBox, QProgressBar, QTabWidget,
-    QTextEdit, QGroupBox, QGridLayout, QComboBox, QDoubleSpinBox, QSplitter,
-    QListWidget, QFrame, QScrollArea, QSlider
-)
-from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal, QObject, QSettings
-from PyQt6.QtGui import QFont, QPixmap, QPalette, QColor
+# Qt imports (optional)
+try:  # pragma: no cover - optional GUI dependency
+    from PyQt6.QtWidgets import (
+        QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QFileDialog,
+        QMessageBox, QHBoxLayout, QCheckBox, QSpinBox, QProgressBar, QTabWidget,
+        QTextEdit, QGroupBox, QGridLayout, QComboBox, QDoubleSpinBox, QSplitter,
+        QListWidget, QFrame, QScrollArea, QSlider
+    )
+    from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal, QObject, QSettings
+    from PyQt6.QtGui import QFont, QPixmap, QPalette, QColor
+    QT_AVAILABLE = True
+except Exception:  # pragma: no cover - headless environments
+    QT_AVAILABLE = False
+
+    # Minimal stubs so the analysis code can be imported without Qt
+    class QObject:  # type: ignore
+        pass
+
+    class QWidget:  # type: ignore
+        pass
+
+    class QApplication:  # type: ignore
+        pass
+
+    class QVBoxLayout:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class QPushButton:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class QLabel:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class QFileDialog:  # type: ignore
+        pass
+
+    class QMessageBox:  # type: ignore
+        @staticmethod
+        def information(*args, **kwargs):
+            pass
+
+    class QHBoxLayout(QVBoxLayout):
+        pass
+
+    class QCheckBox:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class QSpinBox:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class QProgressBar:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class QTabWidget:  # type: ignore
+        pass
+
+    class QTextEdit:  # type: ignore
+        pass
+
+    class QGroupBox:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class QGridLayout(QVBoxLayout):
+        pass
+
+    class QComboBox:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class QDoubleSpinBox(QSpinBox):
+        pass
+
+    class QSplitter:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class QListWidget:  # type: ignore
+        pass
+
+    class QFrame:  # type: ignore
+        pass
+
+    class QScrollArea:  # type: ignore
+        pass
+
+    class QSlider:  # type: ignore
+        pass
+
+    class QTimer:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class QThread:  # type: ignore
+        pass
+
+    class pyqtSignal:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def emit(self, *args, **kwargs):
+            pass
+
+    class QSettings:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class Qt:  # type: ignore
+        class Orientation:
+            Horizontal = 0
+
+    class QFont:  # type: ignore
+        pass
+
+    class QPixmap:  # type: ignore
+        pass
+
+    class QPalette:  # type: ignore
+        pass
+
+    class QColor:  # type: ignore
+        pass
 
 # Audio playback
 try:
@@ -351,9 +470,57 @@ def post_process(chords: List[Tuple[float,str]], min_dur: float=0.3) -> Tuple[Li
         merged.append((start, cur))
     
     unique_ratio = len(set(n for _,n in merged)) / max(1, len(merged))
-    
+
     perf.end("post_processing")
     return merged, unique_ratio
+
+def detect_melody(y: np.ndarray, sr: int = SR, *, threshold: float = 0.8) -> List[Tuple[float, str]]:
+    """Detect a simple melody line using fundamental frequency estimation.
+
+    Returns a list of (time, note_name) tuples whenever the detected note
+    changes. Frames with low confidence are ignored. This is intentionally
+    lightweight and meant for quick preview rather than transcription-level
+    accuracy.
+    """
+    perf.start("melody_detection")
+    melody: List[Tuple[float, str]] = []
+
+    try:
+        f0, voiced_flag, voiced_prob = librosa.pyin(
+            y,
+            fmin=librosa.note_to_hz('C2'),
+            fmax=librosa.note_to_hz('C7'),
+            sr=sr,
+            hop_length=HOP_LENGTH,
+        )
+        times = librosa.times_like(f0, sr=sr, hop_length=HOP_LENGTH)
+
+        last_note: Optional[str] = None
+        last_time: float = 0.0
+
+        for t, f, vf, vp in zip(times, f0, voiced_flag, voiced_prob):
+            if not vf or vp < threshold or f is None or np.isnan(f):
+                note = None
+            else:
+                try:
+                    note = librosa.hz_to_note(float(f))
+                except Exception:
+                    note = None
+
+            if note != last_note:
+                if last_note is not None:
+                    melody.append((last_time, last_note))
+                last_note = note
+                last_time = float(t)
+
+        if last_note is not None:
+            melody.append((last_time, last_note))
+
+    except Exception as e:
+        print(f"[ERROR] Melody detection failed: {e}")
+
+    perf.end("melody_detection")
+    return [m for m in melody if m[1] is not None]
 
 def detect_chords(path: str, *, progress: Callable[[int],None]|None=None,
                   status: Callable[[str],None]|None=None,
@@ -373,9 +540,20 @@ def detect_chords(path: str, *, progress: Callable[[int],None]|None=None,
             try:
                 with open(cache_file,'r', encoding='utf-8') as f:
                     data = json.load(f)
+                stats = data.get('stats', {})
+                if 'melody' not in stats:
+                    # Melody was not cached; compute quickly now
+                    y_tmp, sr_tmp = librosa.load(path, sr=SR, mono=True)
+                    stats['melody'] = detect_melody(y_tmp, sr_tmp)
+                    data['stats'] = stats
+                    try:
+                        with open(cache_file,'w', encoding='utf-8') as wf:
+                            json.dump(data, wf)
+                    except Exception:
+                        pass
                 if status:
                     status("Loaded from cache.")
-                return data['chords'], data.get('key_signature','Unknown'), data.get('stats',{})
+                return data['chords'], data.get('key_signature','Unknown'), stats
             except Exception:
                 pass
     except Exception as e:
@@ -416,6 +594,10 @@ def detect_chords(path: str, *, progress: Callable[[int],None]|None=None,
     if progress: progress(50)
     key_sig, key_conf = detect_key(chroma) if key_aware else ("Unknown", 0.0)
     st['key_confidence'] = float(key_conf)
+
+    if status: status("Detecting melody...")
+    if progress: progress(55)
+    st['melody'] = detect_melody(y, sr)
 
     if status: status("Building templates...")
     if progress: progress(60)
